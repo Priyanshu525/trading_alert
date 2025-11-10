@@ -203,7 +203,6 @@ def start_worker_background():
         _worker_thread.start()
         print("Background worker thread started.")
 
-# Flask 3.x compatible — run worker on first request
 @app.before_request
 def _ensure_worker_running():
     if not _worker_started:
@@ -222,9 +221,117 @@ def _shutdown():
 atexit.register(_shutdown)
 
 # ======== FLASK ROUTES ========
-INDEX_HTML = """ ... (same HTML as before, unchanged) ... """  # keep your template
+INDEX_HTML = """
+<!doctype html>
+<title>Price Alerts</title>
+<style>
+body{font-family:Arial;margin:18px} label{display:block;margin-top:8px}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+.status-active{color:green;font-weight:bold}
+.status-triggered{color:orange}
+.status-cancelled{color:gray}
+</style>
+<h2>Price Alert Manager</h2>
+<p>OANDA env: <b>{{env}}</b> — Base: <b>{{base}}</b></p>
+<p>DB: <b>{{dbpath}}</b></p>
+<p style="color:darkred">Use practice token while testing. Do not share tokens.</p>
 
-# (keep all the route functions exactly as you had them)
+<h3>Create Alert</h3>
+<form method="post" action="/create">
+  <label>Symbol:
+    <select name="symbol">
+      {% for s in symbols %}<option value="{{s}}">{{s}}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Direction:
+    <select name="direction">
+      <option value="above">Above</option>
+      <option value="below">Below</option>
+      <option value="touch">Touch</option>
+    </select>
+  </label>
+  <label>Target price: <input name="target" required></label>
+  <label>Note (optional): <input name="note" placeholder="Comment"></label>
+  <button type="submit">Add Alert</button>
+</form>
+
+<h3>Active Alerts</h3>
+<table>
+<tr><th>ID</th><th>Instrument</th><th>Dir</th><th>Target</th><th>Note</th><th>Created</th><th>Cancel</th></tr>
+{% for a in active %}
+<tr>
+<td>{{a.id}}</td><td>{{a.instrument}}</td><td>{{a.direction}}</td><td>{{'%.5f'|format(a.target)}}</td>
+<td>{{a.note}}</td><td>{{a.created}}</td>
+<td><form method="post" action="/cancel"><input type="hidden" name="id" value="{{a.id}}"><button>Cancel</button></form></td>
+</tr>{% endfor %}
+</table>
+
+<h3>History</h3>
+<table>
+<tr><th>ID</th><th>Instrument</th><th>Dir</th><th>Target</th><th>Status</th><th>Triggered</th><th>Price</th></tr>
+{% for h in history %}
+<tr><td>{{h.id}}</td><td>{{h.instrument}}</td><td>{{h.direction}}</td><td>{{'%.5f'|format(h.target)}}</td>
+<td class="status-{{h.status}}">{{h.status}}</td><td>{{h.triggered}}</td>
+<td>{{'%.5f'|format(h.price) if h.price else ''}}</td></tr>
+{% endfor %}
+</table>
+<p><a href="/send_test">Send Test Telegram</a> | <a href="/debug_account">Debug Account</a></p>
+"""
+
+@app.route("/")
+def index():
+    rows_active = db_execute("SELECT id,instrument,oanda_instrument,direction,target,note,created_ts FROM alerts WHERE status='active' ORDER BY id DESC", fetch=True) or []
+    active = [{"id":r[0],"instrument":r[1],"direction":r[3],"target":r[4],"note":r[5],"created":datetime.utcfromtimestamp(r[6]).isoformat()+"Z"} for r in rows_active]
+    rows_hist = db_execute("SELECT id,instrument,direction,target,status,created_ts,triggered_ts,triggered_price FROM alerts WHERE status!='active' ORDER BY id DESC LIMIT 200", fetch=True) or []
+    history = [{"id":r[0],"instrument":r[1],"direction":r[2],"target":r[3],"status":r[4],"created":datetime.utcfromtimestamp(r[5]).isoformat()+"Z","triggered":(datetime.utcfromtimestamp(r[6]).isoformat()+"Z" if r[6] else ""),"price":r[7]} for r in rows_hist]
+    return render_template_string(INDEX_HTML, symbols=SYMBOLS, active=active, history=history, env=OANDA_ENV, base=OANDA_BASE, dbpath=DB_FILE_ABS)
+
+@app.route("/create", methods=["POST"])
+def create_alert():
+    instrument = request.form["symbol"].strip().upper()
+    direction = request.form["direction"]
+    try:
+        target = float(request.form["target"])
+    except Exception:
+        return "Invalid target", 400
+    note = request.form.get("note") or ""
+    oanda_instr = to_oanda_instrument(instrument)
+    ts = int(time.time())
+    db_execute("INSERT INTO alerts (instrument,oanda_instrument,direction,target,note,status,created_ts) VALUES (?,?,?,?,?,?,?)",
+               (instrument, oanda_instr, direction, target, note, "active", ts))
+    print(f"Web: created alert {instrument} ({oanda_instr}) dir={direction} target={target} note={note}")
+    return redirect(url_for("index"))
+
+@app.route("/cancel", methods=["POST"])
+def cancel():
+    aid = int(request.form["id"])
+    db_execute("UPDATE alerts SET status='cancelled' WHERE id=?", (aid,))
+    print("Web: cancelled alert", aid)
+    return redirect(url_for("index"))
+
+@app.route("/send_test")
+def send_test():
+    ok = send_telegram("✅ Test message from your Flask alert app.")
+    return jsonify({"sent": ok})
+
+@app.route("/debug_account")
+def debug_account():
+    if not OANDA_TOKEN:
+        return jsonify({"ok": False, "error": "OANDA_TOKEN not set"})
+    try:
+        r = requests.get(f"{OANDA_BASE}/v3/accounts", headers=HEADERS, timeout=8)
+        return jsonify({"ok": r.status_code==200, "status": r.status_code, "text": r.text})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+@app.route("/worker_status")
+def worker_status():
+    return jsonify({"worker_started": bool(_worker_started)})
 
 # ======== RUN ========
 if __name__ == "__main__":
